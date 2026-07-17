@@ -33,6 +33,19 @@ python starter/watch_rollout.py --track T1 --ckpt-dir <ckpt_dir> --seed 0
 python submit/submit.py --token-file <token文件> --track T1 --ckpt <policy_best.ckpt 路径>
 ```
 
+### 批量/自动化脚本（仓库根目录）
+
+```bash
+# 四任务顺序自采（T1→T4 串行，断点续采：中断后重跑即可，已采够的任务读 seed.txt 秒过）
+# 任务清单与 config 名写死在脚本里：adjust_bottle_200ep / grab_roller_300ep / stack_bowls_two_400ep / stack_bowls_three_500ep
+nohup bash collect_all.sh 0 > logs/collect/all.log 2>&1 &     # 参数: [gpu_id]，日志落 logs/collect/<task>_<config>.log
+
+# 监听 T1 采满 200 集后自动转换+训练（带显存安全门：等采集进程退出才开训；AUTO_STOP_COLLECT=1 则自动停采）
+nohup bash watch_and_train_t1.sh 0 4 > logs/watch_train_t1.log 2>&1 &   # 参数: [gpu_id] [batch_size]
+```
+
+`process_data.sh` 会自动把数据键注册进 `policy/ACT/SIM_TASK_CONFIGS.json`，无需手动维护。
+
 ### 测试
 
 评测内核有纯 Python 单测（无 sim/GPU 依赖）：
@@ -75,7 +88,7 @@ pytest recipes/eval/tests/test_graded_score.py::test_full_success_is_one   # 单
 
 ### Task config（external/robotwin_local/task_config/）
 
-- `<task>_200ep.yml`：采集 config（集数/域随机化/场景）。T1 已给 turnkey 的 `adjust_bottle_200ep.yml`；T2–T4 拷贝改名自建。
+- `<task>_200ep.yml`：采集 config（集数/域随机化/场景）。T1 已给 turnkey 的 `adjust_bottle_200ep.yml`；T2–T4 拷贝改名自建（`collect_all.sh` 约定的名字：`grab_roller_300ep` / `stack_bowls_two_400ep` / `stack_bowls_three_500ep`，须先建好对应 yml 才能跑）。
 - `<task>_clean.yml`：评测 config，随包下发，**勿改**。
 - `policy/ACT/deploy_policy.yml`：推理架构配置（hidden 512 / chunk 50），**必须与 ckpt 训练时架构一致**，不匹配会在加载时报 state_dict size mismatch（768/chunk-100 的大模型用 `deploy_big.yml`）。
 
