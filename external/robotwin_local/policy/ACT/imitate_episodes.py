@@ -375,11 +375,6 @@ def forward_pass(data, policy):
         action_data.cuda(),
         is_pad.cuda(),
     )
-    # images arrive uint8 (shm-lean dataloader handoff, see utils.EpisodicDataset); the /255
-    # float conversion moved here onto the GPU -- numerically identical to converting in the
-    # worker. float images (ACT_AUG path) pass through unchanged.
-    if image_data.dtype == torch.uint8:
-        image_data = image_data.float().div_(255.0)
     out = policy(qpos_data, image_data, action_data, is_pad)  # TODO remove None
     # DataParallel returns one scalar per GPU for each key; reduce to a single scalar so the
     # downstream val-loss compare / .item() summaries see scalars, not length-num_gpus vectors.
@@ -396,19 +391,6 @@ def train_bc(train_dataloader, val_dataloader, config):
     ddp = config.get("ddp", False)
     local_rank = config.get("local_rank", -1)
     is_main = config.get("is_main", True)
-
-    # ---- 训练提速旋钮(env 开关;权重/ckpt 始终存 fp32,eval/deploy 完全不受影响)----
-    # ACT_AMP=1(默认): bf16 autocast(Ampere+ 支持才启用),单步 ~1.5-2x 提速、激活显存降
-    # ~40%(8G 卡可开更大 batch)。ACT_AMP=0 还原纯 fp32 逐位一致的旧行为。
-    use_amp = os.environ.get("ACT_AMP", "1") == "1" and torch.cuda.is_bf16_supported()
-    # ACT_VAL_EVERY=N(默认 5): 每 N 个 epoch 跑一次验证(旧行为 =1,每 epoch 验证,val 集
-    # 约占每 epoch 计算的 1/4)。best-ckpt 选择粒度变粗 N 倍,但小 val 集本身噪声大,损失可忽略。
-    val_every = max(1, int(os.environ.get("ACT_VAL_EVERY", "5")))
-    # ACT_EARLY_STOP_PATIENCE=K(默认 0=关): 连续 K 次验证无提升即提前停训(按验证次数计,
-    # 即 K*ACT_VAL_EVERY 个 epoch)。val 集小、噪声大,建议 K>=40 的宽松值。
-    patience = int(os.environ.get("ACT_EARLY_STOP_PATIENCE", "0"))
-    if is_main:
-        print(f"[train_bc] amp(bf16)={use_amp} val_every={val_every} early_stop_patience={patience}")
 
     set_seed(seed)
 
@@ -432,26 +414,21 @@ def train_bc(train_dataloader, val_dataloader, config):
     validation_history = []
     min_val_loss = np.inf
     best_ckpt_info = None
-    vals_since_best = 0
-    stop_flag = torch.zeros(1, device="cuda")
 
     for epoch in tqdm(range(num_epochs)):
         if ddp:
             train_dataloader.sampler.set_epoch(epoch)  # reshuffle the per-rank shards each epoch
         print(f"\nEpoch {epoch}")
-        # every rank computes the same schedule so the DDP broadcast below stays in lockstep
-        is_val_epoch = (epoch % val_every == 0) or (epoch == num_epochs - 1)
         # validation -- rank 0 only: it owns best-ckpt selection + saving, so the other ranks skip the
         # redundant val pass and wait at the barrier, keeping the next train all-reduce in lockstep.
-        if is_main and is_val_epoch:
+        if is_main:
             with torch.inference_mode():
                 policy.eval()
                 epoch_dicts = []
                 for batch_idx, data in enumerate(val_dataloader):
                     # eval on the unwrapped module: calling the DDP wrapper repeatedly without a backward
                     # leaves its grad reducer mid-reduction and crashes the next train step.
-                    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
-                        forward_dict = forward_pass(data, save_policy)
+                    forward_dict = forward_pass(data, save_policy)
                     epoch_dicts.append(forward_dict)
                 epoch_summary = compute_dict_mean(epoch_dicts)
                 validation_history.append(epoch_summary)
@@ -460,30 +437,17 @@ def train_bc(train_dataloader, val_dataloader, config):
                 if epoch_val_loss < min_val_loss:
                     min_val_loss = epoch_val_loss
                     best_ckpt_info = (epoch, min_val_loss, deepcopy(save_policy.state_dict()))
-                    vals_since_best = 0
-                else:
-                    vals_since_best += 1
             print(f"Val loss:   {epoch_val_loss:.5f}")
-            if patience > 0 and vals_since_best >= patience:
-                stop_flag.fill_(1)
         if ddp:
             dist.barrier()
-            if is_val_epoch:
-                dist.broadcast(stop_flag, src=0)  # all ranks must agree to break together
-        if stop_flag.item():
-            if is_main:
-                print(f"[train_bc] early stop @ epoch {epoch}: {patience} validations w/o improvement")
-            break
 
         # training
         policy.train()
         optimizer.zero_grad()
         for batch_idx, data in enumerate(train_dataloader):
-            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
-                forward_dict = forward_pass(data, policy)
-                # backward (DP gathers per-GPU scalars into a vector -> reduce to scalar)
-                loss = forward_dict["loss"].mean()
-            # bf16 dynamic range ~= fp32 -> no GradScaler needed; backward outside autocast
+            forward_dict = forward_pass(data, policy)
+            # backward (DP gathers per-GPU scalars into a vector -> reduce to scalar)
+            loss = forward_dict["loss"].mean()
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()

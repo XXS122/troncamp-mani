@@ -9,15 +9,10 @@ instruction_type: unseen
 # ACT-specific arguments
 action_dim: 16
 kl_weight: 10.0
-chunk_size: 50
+chunk_size: 50 
 hidden_dim: 512
 dim_feedforward: 3200
-temporal_agg: false
-# Partial-chunk closed-loop execution: re-query the policy every N steps (execute only the
-# first N of each 50-action chunk). null = chunk_size = original open-loop ACT. For T2
-# grab_roller try 25 (2x corrections) -- A/B with starter/eval_local.py BEFORE submitting;
-# does not touch the ckpt/architecture, only inference cadence.
-query_frequency: null
+temporal_agg: false 
 device: cuda:0
 
 # DETR parser args

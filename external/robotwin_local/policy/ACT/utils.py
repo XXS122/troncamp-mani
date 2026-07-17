@@ -13,24 +13,6 @@ import torchvision.transforms as T
 _ACT_AUG = os.environ.get("ACT_AUG", "0") == "1"
 _AUG_TF = T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05) if _ACT_AUG else None
 
-# ACT_WORKERS: dataloader worker count (default 2). __getitem__ does 3x 640x480 JPEG decode per
-# sample -- on machines with spare CPU cores, 4-8 workers removes the decode bottleneck and feeds
-# the GPU continuously (biggest single wall-time win alongside ACT_AMP). Lower it on RAM-tight
-# boxes: each worker holds its own decode buffers.
-_NUM_WORKERS = max(0, int(os.environ.get("ACT_WORKERS", "2")))
-# ACT_PREFETCH (default 4): batches each worker keeps in flight. Peak /dev/shm usage scales as
-# workers * prefetch * batch_bytes (~90MB/batch at batch 8) -- lower this or workers if shm is
-# tight instead of giving up parallel loading entirely.
-_PREFETCH = max(1, int(os.environ.get("ACT_PREFETCH", "4")))
-# ACT_SHARING=file_system: route worker->main tensor handoff through disk-backed files instead
-# of /dev/shm fds. Fixes "DataLoader worker killed by Bus error: out of shared memory" inside
-# docker containers with the default 64MB --shm-size when relaunching with --ipc=host or a
-# bigger --shm-size isn't possible. Slightly slower than shm; unset = torch default.
-_SHARING = os.environ.get("ACT_SHARING", "")
-if _SHARING:
-    torch.multiprocessing.set_sharing_strategy(_SHARING)
-    print(f"[utils] torch multiprocessing sharing strategy: {_SHARING}")
-
 import IPython
 
 e = IPython.embed
@@ -101,13 +83,11 @@ class EpisodicDataset(torch.utils.data.Dataset):
         # channel last
         image_data = torch.einsum("k h w c -> k c h w", image_data)
 
+        # normalize image and change dtype to float
+        image_data = image_data / 255.0
         if _AUG_TF is not None:
-            # aug path needs float; per-camera color jitter (T2/T4), independent params per view
-            image_data = image_data / 255.0
+            # per-camera color jitter (T2/T4); independent random params per view
             image_data = torch.stack([_AUG_TF(image_data[k]) for k in range(image_data.shape[0])])
-        # else: images stay uint8 across the worker->main handoff -- 4x less /dev/shm than
-        # float32 (the top shm consumer); forward_pass converts to [0,1] float on the GPU,
-        # numerically identical to dividing here.
         action_data = (action_data - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
         qpos_data = (qpos_data - self.norm_stats["qpos_mean"]) / self.norm_stats["qpos_std"]
 
@@ -188,28 +168,24 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
     # Under DDP each rank gets a disjoint shard via DistributedSampler (which owns the shuffling) --
     # this is what makes N ranks ~Nx throughput. Non-distributed keeps plain shuffle=True.
     train_sampler = DistributedSampler(train_dataset, shuffle=True) if distributed else None
-    # num_workers=0 (debug) is incompatible with prefetch_factor/persistent_workers
-    worker_kwargs = (dict(num_workers=_NUM_WORKERS, prefetch_factor=_PREFETCH, persistent_workers=True)
-                     if _NUM_WORKERS > 0 else dict(num_workers=0))
-    # val runs only every ACT_VAL_EVERY epochs on the small 20% split, but persistent workers
-    # hold their prefetch queues in /dev/shm 24/7 -- giving val the full train worker count
-    # DOUBLES peak shm and tips over small-shm docker containers mid-run. Cap it at 2 workers.
-    val_worker_kwargs = (dict(num_workers=min(2, _NUM_WORKERS), prefetch_factor=2, persistent_workers=True)
-                         if _NUM_WORKERS > 0 else dict(num_workers=0))
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=batch_size_train,
         shuffle=(train_sampler is None),
         sampler=train_sampler,
         pin_memory=True,
-        **worker_kwargs,
+        num_workers=2,
+        prefetch_factor=4,
+        persistent_workers=True,
     )
     val_dataloader = DataLoader(
         val_dataset,
         batch_size=batch_size_val,
         shuffle=True,
         pin_memory=True,
-        **val_worker_kwargs,
+        num_workers=2,
+        prefetch_factor=4,
+        persistent_workers=True,
     )
 
     return train_dataloader, val_dataloader, norm_stats, train_dataset.is_sim
