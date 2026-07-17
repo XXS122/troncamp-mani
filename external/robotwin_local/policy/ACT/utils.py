@@ -18,6 +18,18 @@ _AUG_TF = T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05) 
 # the GPU continuously (biggest single wall-time win alongside ACT_AMP). Lower it on RAM-tight
 # boxes: each worker holds its own decode buffers.
 _NUM_WORKERS = max(0, int(os.environ.get("ACT_WORKERS", "2")))
+# ACT_PREFETCH (default 4): batches each worker keeps in flight. Peak /dev/shm usage scales as
+# workers * prefetch * batch_bytes (~90MB/batch at batch 8) -- lower this or workers if shm is
+# tight instead of giving up parallel loading entirely.
+_PREFETCH = max(1, int(os.environ.get("ACT_PREFETCH", "4")))
+# ACT_SHARING=file_system: route worker->main tensor handoff through disk-backed files instead
+# of /dev/shm fds. Fixes "DataLoader worker killed by Bus error: out of shared memory" inside
+# docker containers with the default 64MB --shm-size when relaunching with --ipc=host or a
+# bigger --shm-size isn't possible. Slightly slower than shm; unset = torch default.
+_SHARING = os.environ.get("ACT_SHARING", "")
+if _SHARING:
+    torch.multiprocessing.set_sharing_strategy(_SHARING)
+    print(f"[utils] torch multiprocessing sharing strategy: {_SHARING}")
 
 import IPython
 
@@ -175,7 +187,7 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
     # this is what makes N ranks ~Nx throughput. Non-distributed keeps plain shuffle=True.
     train_sampler = DistributedSampler(train_dataset, shuffle=True) if distributed else None
     # num_workers=0 (debug) is incompatible with prefetch_factor/persistent_workers
-    worker_kwargs = (dict(num_workers=_NUM_WORKERS, prefetch_factor=4, persistent_workers=True)
+    worker_kwargs = (dict(num_workers=_NUM_WORKERS, prefetch_factor=_PREFETCH, persistent_workers=True)
                      if _NUM_WORKERS > 0 else dict(num_workers=0))
     train_dataloader = DataLoader(
         train_dataset,
