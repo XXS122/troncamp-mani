@@ -13,6 +13,12 @@ import torchvision.transforms as T
 _ACT_AUG = os.environ.get("ACT_AUG", "0") == "1"
 _AUG_TF = T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05) if _ACT_AUG else None
 
+# ACT_WORKERS: dataloader worker count (default 2). __getitem__ does 3x 640x480 JPEG decode per
+# sample -- on machines with spare CPU cores, 4-8 workers removes the decode bottleneck and feeds
+# the GPU continuously (biggest single wall-time win alongside ACT_AMP). Lower it on RAM-tight
+# boxes: each worker holds its own decode buffers.
+_NUM_WORKERS = max(0, int(os.environ.get("ACT_WORKERS", "2")))
+
 import IPython
 
 e = IPython.embed
@@ -168,24 +174,23 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
     # Under DDP each rank gets a disjoint shard via DistributedSampler (which owns the shuffling) --
     # this is what makes N ranks ~Nx throughput. Non-distributed keeps plain shuffle=True.
     train_sampler = DistributedSampler(train_dataset, shuffle=True) if distributed else None
+    # num_workers=0 (debug) is incompatible with prefetch_factor/persistent_workers
+    worker_kwargs = (dict(num_workers=_NUM_WORKERS, prefetch_factor=4, persistent_workers=True)
+                     if _NUM_WORKERS > 0 else dict(num_workers=0))
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=batch_size_train,
         shuffle=(train_sampler is None),
         sampler=train_sampler,
         pin_memory=True,
-        num_workers=2,
-        prefetch_factor=4,
-        persistent_workers=True,
+        **worker_kwargs,
     )
     val_dataloader = DataLoader(
         val_dataset,
         batch_size=batch_size_val,
         shuffle=True,
         pin_memory=True,
-        num_workers=2,
-        prefetch_factor=4,
-        persistent_workers=True,
+        **worker_kwargs,
     )
 
     return train_dataloader, val_dataloader, norm_stats, train_dataset.is_sim

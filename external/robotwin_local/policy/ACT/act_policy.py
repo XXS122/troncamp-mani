@@ -119,8 +119,20 @@ class ACT:
         self.state_dim = RoboTwin_Config.action_dim  # Standard joint dimension for bimanual robot
         self.max_timesteps = 3000  # Large enough for deployment
 
-        # Set query frequency based on temporal_agg - matching imitate_episodes.py logic
-        self.query_frequency = self.num_queries
+        # Set query frequency based on temporal_agg - matching imitate_episodes.py logic.
+        # Partial-chunk execution (deploy yml key `query_frequency`, null = chunk_size): re-query
+        # the policy every N < chunk_size steps, executing only the first N actions of each
+        # predicted chunk (diffusion-policy-style action horizon Ta < prediction horizon Tp).
+        # Full open-loop chunks accumulate drift the policy never gets to correct -- with
+        # grab_roller's 400-step limit a chunk of 50 means only 8 corrections per episode.
+        # Costs (chunk/N)x more forward passes; ignored when temporal_agg is on (already 1-step).
+        # precedence: deploy yml key > env ACT_QUERY_FREQUENCY (local A/B without yml edits) > chunk
+        qf = (args_override.get("query_frequency")
+              or os.environ.get("ACT_QUERY_FREQUENCY")
+              or self.num_queries)
+        self.query_frequency = max(1, min(int(qf), self.num_queries))
+        if self.query_frequency != self.num_queries:
+            print(f"Partial-chunk execution: re-query every {self.query_frequency}/{self.num_queries} steps")
         if self.temporal_agg:
             self.query_frequency = 1
             # Initialize with zeros matching imitate_episodes.py format
