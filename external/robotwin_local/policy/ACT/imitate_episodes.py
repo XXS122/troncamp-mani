@@ -375,6 +375,11 @@ def forward_pass(data, policy):
         action_data.cuda(),
         is_pad.cuda(),
     )
+    # images arrive uint8 (shm-lean dataloader handoff, see utils.EpisodicDataset); the /255
+    # float conversion moved here onto the GPU -- numerically identical to converting in the
+    # worker. float images (ACT_AUG path) pass through unchanged.
+    if image_data.dtype == torch.uint8:
+        image_data = image_data.float().div_(255.0)
     out = policy(qpos_data, image_data, action_data, is_pad)  # TODO remove None
     # DataParallel returns one scalar per GPU for each key; reduce to a single scalar so the
     # downstream val-loss compare / .item() summaries see scalars, not length-num_gpus vectors.
