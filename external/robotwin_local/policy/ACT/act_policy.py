@@ -100,53 +100,6 @@ def kl_divergence(mu, logvar):
     return total_kld, dimension_wise_kld, mean_kld
 
 
-# ---------------------------------------------------------------------------
-# Inference-mode selection per task (success-rate lever; NO architecture/ckpt
-# change -- same state_dict, only when/how predicted chunks get executed).
-#
-# Official T2-T4 eval runs THIS package's code (the submitted --code-dir shadows
-# policy/ACT via sys.path) but reads deploy_policy.yml + CLI flags from the
-# organizer's own runtime, where temporal_agg is always forced False. So this
-# dict is the ONE switch guaranteed to reach official evaluation. A/B locally
-# first (starter/eval_local.py + the env vars below), then pin the winner here
-# before submitting.
-#
-# Grounding: the ACT paper's ablations (arXiv:2304.13705) show chunking drives
-# success (1%->44% going k=1->100) but full open-loop execution loses
-# reactivity, and temporal ensembling recovers ~+3.3% by smoothing
-# chunk-boundary jumps; BID (arXiv:2408.17355, ICLR'25) confirms the
-# chunk-boundary consistency/reactivity tradeoff is a first-order failure
-# source. Supported knobs per task:
-#   "temporal_agg": True    per-step re-query + exp-weighted ensemble (k=0.01)
-#   "query_frequency": N    partial-chunk execution: re-query every N < chunk
-#                           steps, run only the first N actions of each chunk
-# Local A/B env overrides (highest precedence; no code edit needed):
-#   ACT_TEMPORAL_AGG=0|1  ACT_QUERY_FREQUENCY=N
-TASK_INFERENCE_OVERRIDES = {
-    # grab_roller: quasi-static two-arm lift, 400-step limit -> open-loop chunk
-    # 50 gives only 8 corrections/episode; ensemble smooths the synchronized
-    # lift. Pinned per the paper's ablation -- CONFIRM with eval_local A/B.
-    "grab_roller": {"temporal_agg": True},
-}
-
-
-def _resolve_inference_mode(args_override):
-    """(temporal_agg, query_frequency_override) with precedence:
-    env (local A/B) > TASK_INFERENCE_OVERRIDES (submitted default) > caller args."""
-    ov = dict(TASK_INFERENCE_OVERRIDES.get(args_override.get("task_name") or "", {}))
-    env_ta = os.environ.get("ACT_TEMPORAL_AGG")
-    env_qf = os.environ.get("ACT_QUERY_FREQUENCY")
-    if env_ta is not None or env_qf is not None:
-        ov = {}  # an env-driven A/B run fully defines the mode; code defaults step aside
-        if env_ta is not None:
-            ov["temporal_agg"] = env_ta == "1"
-        if env_qf is not None:
-            ov["query_frequency"] = int(env_qf)
-    temporal_agg = ov.get("temporal_agg", bool(args_override.get("temporal_agg", False)))
-    query_frequency = ov.get("query_frequency") or args_override.get("query_frequency")
-    return temporal_agg, query_frequency
-
-
 class ACT:
 
     def __init__(self, args_override=None, RoboTwin_Config=None):
@@ -161,18 +114,13 @@ class ACT:
         self.policy.eval()
 
         # Temporal aggregation settings
-        self.temporal_agg, _qf_override = _resolve_inference_mode(args_override)
+        self.temporal_agg = args_override.get("temporal_agg", False)
         self.num_queries = args_override["chunk_size"]
         self.state_dim = RoboTwin_Config.action_dim  # Standard joint dimension for bimanual robot
         self.max_timesteps = 3000  # Large enough for deployment
 
         # Set query frequency based on temporal_agg - matching imitate_episodes.py logic
         self.query_frequency = self.num_queries
-        if _qf_override:
-            self.query_frequency = max(1, min(int(_qf_override), self.num_queries))
-        print(f"[ACT] task={args_override.get('task_name')!r} inference mode: "
-              f"temporal_agg={self.temporal_agg} "
-              f"query_frequency={1 if self.temporal_agg else self.query_frequency}/{self.num_queries}")
         if self.temporal_agg:
             self.query_frequency = 1
             # Initialize with zeros matching imitate_episodes.py format
