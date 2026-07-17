@@ -21,6 +21,14 @@ _AUG_TF = T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05) 
 # per-worker seeded, unlike numpy's in dataloader workers).
 _AUG_SHIFT_PAD = 12 if os.environ.get("ACT_AUG_SHIFT", "0") == "1" else 0
 
+# Dataloader knobs (defaults = the stock values; unset -> behavior identical to upstream).
+# Worker->main batch handoff lives in /dev/shm, steady state ~= workers * prefetch * 2 loaders
+# * ~90MB/batch (batch 8). In small-shm docker containers (3G here) TWO concurrent trainings at
+# the stock 2x4 (~1.4G each) overflow shm and SIGBUS -- launch the second run with
+# ACT_PREFETCH=2 (~0.72G) to share the card safely.
+_NUM_WORKERS = max(0, int(os.environ.get("ACT_WORKERS", "2")))
+_PREFETCH = max(1, int(os.environ.get("ACT_PREFETCH", "4")))
+
 
 def _rand_shift(img):
     """img (C,H,W) float in [0,1] -> same shape, randomly shifted by up to _AUG_SHIFT_PAD px."""
@@ -189,24 +197,23 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
     # Under DDP each rank gets a disjoint shard via DistributedSampler (which owns the shuffling) --
     # this is what makes N ranks ~Nx throughput. Non-distributed keeps plain shuffle=True.
     train_sampler = DistributedSampler(train_dataset, shuffle=True) if distributed else None
+    # num_workers=0 (debug) is incompatible with prefetch_factor/persistent_workers
+    worker_kwargs = (dict(num_workers=_NUM_WORKERS, prefetch_factor=_PREFETCH, persistent_workers=True)
+                     if _NUM_WORKERS > 0 else dict(num_workers=0))
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=batch_size_train,
         shuffle=(train_sampler is None),
         sampler=train_sampler,
         pin_memory=True,
-        num_workers=2,
-        prefetch_factor=4,
-        persistent_workers=True,
+        **worker_kwargs,
     )
     val_dataloader = DataLoader(
         val_dataset,
         batch_size=batch_size_val,
         shuffle=True,
         pin_memory=True,
-        num_workers=2,
-        prefetch_factor=4,
-        persistent_workers=True,
+        **worker_kwargs,
     )
 
     return train_dataloader, val_dataloader, norm_stats, train_dataset.is_sim
