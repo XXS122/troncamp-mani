@@ -31,7 +31,7 @@ Tron2 双臂机器人,四个**难度递增**的操作任务(难度只来自任�
 > [§提交](https://limx-troncamp.github.io/troncamp-web-mani/doc.html#submit))。下面是命令速查。
 
 > **环境名提示**:安装建 / 用本赛事独立命名的 conda 环境 `troncamp_env`,与 RoboTwin 官方教程默认的
-> `RoboTwin` 环境天然隔离,不会复用或污染你已有的环境。想换名字,替换安装命令里的 `troncamp_env` 即可。
+> `RoboTwin` 环境天然隔离,不会复用或污染你已有的环境。想换名字,替换安装命令里的 `troncamp_env` p即可。
 
 ```bash
 # 0. 装环境 —— 见参赛文档「§安装」的透明分步(建 conda 环境 + RoboTwin/SAPIEN/cuRobo + ACT 依赖,
