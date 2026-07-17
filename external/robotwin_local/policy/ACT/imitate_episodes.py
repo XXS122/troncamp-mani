@@ -392,6 +392,17 @@ def train_bc(train_dataloader, val_dataloader, config):
     local_rank = config.get("local_rank", -1)
     is_main = config.get("is_main", True)
 
+    # 成功率导向训练旋钮(env 开关,默认全关 = 与官方 turnkey 逐位一致;推理零改动):
+    # ACT_EMA=1     参数指数滑动平均(decay 可用 ACT_EMA_DECAY 覆盖,默认 0.999),
+    #               训毕另存 policy_ema.ckpt 作为第三个提交候选(BC 文献一致:EMA 更稳)。
+    # ACT_COS_LR=1  CosineAnnealingLR 1e-5 -> 1e-6:恒定 lr 下训练后期 loss 抖动大、
+    #               policy_last 毛躁,余弦衰减让末段精修收敛。
+    use_ema = os.environ.get("ACT_EMA", "0") == "1"
+    ema_decay = float(os.environ.get("ACT_EMA_DECAY", "0.999"))
+    use_cos_lr = os.environ.get("ACT_COS_LR", "0") == "1"
+    if is_main:
+        print(f"[train_bc] ema={use_ema}(decay={ema_decay}) cos_lr={use_cos_lr}")
+
     set_seed(seed)
 
     policy = make_policy(policy_class, policy_config)
@@ -409,6 +420,16 @@ def train_bc(train_dataloader, val_dataloader, config):
             policy, device_ids=[local_rank], find_unused_parameters=True
         )
     save_policy = policy.module if hasattr(policy, "module") else policy
+
+    scheduler = (torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
+                 if use_cos_lr else None)
+    # EMA 只在 rank0 维护(DDP 各 rank 参数经 all-reduce 一致,rank0 足够);对 state_dict
+    # 里全部浮点项(参数+BN 统计)做滑动平均,整数 buffer(num_batches_tracked)存盘时直拷。
+    ema_state, ema_pairs = None, None
+    if use_ema and is_main:
+        msd = save_policy.state_dict()
+        ema_state = {k: v.detach().clone() for k, v in msd.items() if v.dtype.is_floating_point}
+        ema_pairs = [(ema_state[k], msd[k]) for k in ema_state]
 
     train_history = []
     validation_history = []
@@ -451,7 +472,13 @@ def train_bc(train_dataloader, val_dataloader, config):
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
+            if ema_pairs is not None:
+                with torch.no_grad():
+                    for e_t, m_t in ema_pairs:
+                        e_t.mul_(ema_decay).add_(m_t, alpha=1.0 - ema_decay)
             train_history.append(detach_dict(forward_dict))
+        if scheduler is not None:
+            scheduler.step()
         epoch_summary = compute_dict_mean(train_history[(batch_idx + 1) * epoch:(batch_idx + 1) * (epoch + 1)])
         epoch_train_loss = epoch_summary["loss"]
         print(f"Train loss: {epoch_train_loss:.5f}")
@@ -467,6 +494,12 @@ def train_bc(train_dataloader, val_dataloader, config):
     if is_main:
         ckpt_path = os.path.join(ckpt_dir, f"policy_last.ckpt")
         torch.save(save_policy.state_dict(), ckpt_path)
+
+    if is_main and ema_state is not None:
+        # 浮点项用 EMA 值、整数 buffer 用当前值,拼成完整 state_dict(与官方 deploy 直接兼容)
+        full_sd = {k: ema_state.get(k, v) for k, v in save_policy.state_dict().items()}
+        torch.save(full_sd, os.path.join(ckpt_dir, "policy_ema.ckpt"))
+        print("Saved EMA weights to policy_ema.ckpt")
 
     if is_main:
         best_epoch, min_val_loss, best_state_dict = best_ckpt_info

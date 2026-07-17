@@ -20,6 +20,13 @@ import IPython
 
 e = IPython.embed
 
+# ACT_GRIPPER_W (default 1.0 = off): TRAINING-only L1 upweight on the two gripper dims of the
+# 16-D Tron2 action (index 7 = left gripper, 15 = right gripper; layout 7 arm + 1 gripper per
+# arm). Success on grab_roller / stack_bowls hinges on gripper closure, which uniform L1 gives
+# only 2/16 of the loss mass -- upweighting targets the "reached but didn't grip" failure mode.
+# The inference path (actions=None branch) is untouched.
+_GRIPPER_W = float(os.environ.get("ACT_GRIPPER_W", "1.0"))
+
 
 class ACTPolicy(nn.Module):
 
@@ -30,6 +37,8 @@ class ACTPolicy(nn.Module):
         self.optimizer = optimizer
         self.kl_weight = args_override["kl_weight"]
         print(f"KL Weight {self.kl_weight}")
+        if _GRIPPER_W != 1.0:
+            print(f"[ACTPolicy] gripper L1 weight x{_GRIPPER_W} (dims 7,15; training only)")
 
     def __call__(self, qpos, image, actions=None, is_pad=None):
         env_state = None
@@ -43,6 +52,10 @@ class ACTPolicy(nn.Module):
             total_kld, dim_wise_kld, mean_kld = kl_divergence(mu, logvar)
             loss_dict = dict()
             all_l1 = F.l1_loss(actions, a_hat, reduction="none")
+            if _GRIPPER_W != 1.0 and actions.shape[-1] == 16:
+                w = torch.ones(16, device=all_l1.device, dtype=all_l1.dtype)
+                w[7] = w[15] = _GRIPPER_W
+                all_l1 = all_l1 * w
             l1 = (all_l1 * ~is_pad.unsqueeze(-1)).mean()
             loss_dict["l1"] = l1
             loss_dict["kl"] = total_kld[0]

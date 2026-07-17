@@ -13,6 +13,24 @@ import torchvision.transforms as T
 _ACT_AUG = os.environ.get("ACT_AUG", "0") == "1"
 _AUG_TF = T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05) if _ACT_AUG else None
 
+# ACT_AUG_SHIFT=1 (default off): train-time random translation -- reflect-pad 12px then crop
+# back to the original size (= +-12px shift per camera view). Targets the object-pose
+# randomization axis of grab_roller / stack_bowls; image geometry is unchanged, so inference
+# still consumes the raw full frame and is untouched. robomimic-style random crop/shift is the
+# highest-yield single image augmentation for manipulation BC. Uses the torch RNG (correctly
+# per-worker seeded, unlike numpy's in dataloader workers).
+_AUG_SHIFT_PAD = 12 if os.environ.get("ACT_AUG_SHIFT", "0") == "1" else 0
+
+
+def _rand_shift(img):
+    """img (C,H,W) float in [0,1] -> same shape, randomly shifted by up to _AUG_SHIFT_PAD px."""
+    p = _AUG_SHIFT_PAD
+    _, h, w = img.shape
+    padded = torch.nn.functional.pad(img.unsqueeze(0), (p, p, p, p), mode="reflect").squeeze(0)
+    dy = int(torch.randint(0, 2 * p + 1, (1,)))
+    dx = int(torch.randint(0, 2 * p + 1, (1,)))
+    return padded[:, dy:dy + h, dx:dx + w]
+
 import IPython
 
 e = IPython.embed
@@ -88,6 +106,9 @@ class EpisodicDataset(torch.utils.data.Dataset):
         if _AUG_TF is not None:
             # per-camera color jitter (T2/T4); independent random params per view
             image_data = torch.stack([_AUG_TF(image_data[k]) for k in range(image_data.shape[0])])
+        if _AUG_SHIFT_PAD:
+            # independent random translation per camera view (train-time only)
+            image_data = torch.stack([_rand_shift(image_data[k]) for k in range(image_data.shape[0])])
         action_data = (action_data - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
         qpos_data = (qpos_data - self.norm_stats["qpos_mean"]) / self.norm_stats["qpos_std"]
 
